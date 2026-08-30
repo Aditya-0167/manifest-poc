@@ -40,18 +40,37 @@ jobs:
 
       - name: Start mock malicious registry
         run: |
-          python3 mock_registry.py 0 > mock_registry_startup.log 2>&1 &
-          echo $! > mock_registry.pid
+          # -u = unbuffered stdout/stderr, so print() output reaches the
+          # redirected file immediately instead of sitting in a buffer.
+          python3 -u mock_registry.py 0 > mock_registry_startup.log 2>&1 &
+          MOCK_PID=$!
+          echo $MOCK_PID > mock_registry.pid
+          echo "Started mock_registry.py with PID $MOCK_PID"
+
           # Wait for the server to print its assigned port and digests.
-          for i in $(seq 1 20); do
+          FOUND=0
+          for i in $(seq 1 40); do
             if grep -q "MOCK_REGISTRY_PORT=" mock_registry_startup.log 2>/dev/null; then
+              FOUND=1
+              break
+            fi
+            if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+              echo "Process $MOCK_PID is no longer running (exited early)."
               break
             fi
             sleep 0.25
           done
-          cat mock_registry_startup.log
-          echo "---"
-          grep "MOCK_REGISTRY_PORT=" mock_registry_startup.log
+
+          echo "=== mock_registry_startup.log ==="
+          cat mock_registry_startup.log || echo "(cat failed)"
+          echo "=== process status ==="
+          ps -p "$MOCK_PID" || echo "(process not found)"
+          echo "=== end diagnostics ==="
+
+          if [ "$FOUND" -ne 1 ]; then
+            echo "FAILED: never saw MOCK_REGISTRY_PORT= in the log within the wait window."
+            exit 1
+          fi
 
       - name: Run PoC against the mock registry
         run: |
